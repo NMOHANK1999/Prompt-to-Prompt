@@ -17,6 +17,8 @@ torch_device = ("cuda" if torch.cuda.is_available()
           else  "cpu")
 torch_dtype = (torch.bfloat16 if torch_device == "cuda" else torch.float32)
 
+#import ipdb 
+
 # -----------------------------------------------------------------------------
 # Sequence alignment and Mapper Functions
 # -----------------------------------------------------------------------------
@@ -66,29 +68,41 @@ def get_replacement_mapper_(x: str, y: str, tokenizer):
 
     
     ####TODO####
-    #need to fix the val 
     # Construct the mapper
-    differing_indices = [i for i, (wx, wy) in enumerate(zip(words_x, words_y)) if wx != wy]
-    move_r, move_c = 0, 0
-    for idx in range(len(words_x)):
-        if idx in differing_indices:
-                tokens_x = tokenizer(words_x[idx], add_special_tokens=False, return_tensors="np")['input_ids'][0]
-                tokens_y = tokenizer(words_y[idx], add_special_tokens=False, return_tensors="np")['input_ids'][0]
-                len_x, len_y = len(tokens_x), len(tokens_y)
-                move_c += (len_y-1)
-                move_r += (len_x-1)
-                if (len_y * len_x) == len_y or (len_y * len_x) == len_x:
-                    val = 1 / (len_y * len_x)
-                else:
-                    val = 1 / len_y 
-                for i in range(len_x):
-                    for j in range(len_y):
-                            mapper[idx + i + 1][idx + j + 1] = val
-                        
-        else:
-            mapper[idx + move_r + 1][idx + move_c + 1] = 1
     
+    for i in range(len(words_y)): 
+        if words_y[i] != words_x[i]:
+            diff_indices = i 
+            
+    source_ind = get_word_inds(x, diff_indices, tokenizer)
+    target_ind = get_word_inds(y, diff_indices, tokenizer)
+
+    i = j = 0  
+
+    while i < len(mapper) and j < len(mapper):
+        if i == source_ind[0]:
+            if len(source_ind) == len(target_ind):
+                for s_idx, t_idx in zip(source_ind, target_ind):
+                    mapper[s_idx, t_idx] = 1.0
+            elif len(source_ind) > len(target_ind):
+                ratio = 1.0 / len(source_ind)
+                for t_idx in target_ind:
+                    for s_idx in source_ind:
+                        mapper[s_idx, t_idx] = ratio
+            else:
+                ratio = 1.0 / len(target_ind)
+                for s_idx in source_ind:
+                    for t_idx in target_ind:
+                        mapper[s_idx, t_idx] = ratio
+            i += len(source_ind)
+            j += len(target_ind)
+        else:
+                mapper[i, j] = 1.0
+                i += 1
+                j += 1
+            
     ####END_TODO####
+    
     mapper = torch.from_numpy(mapper).to(torch_device, dtype=torch_dtype)
     return mapper
 
@@ -176,10 +190,10 @@ def replace_module_by_class_and_name(module: Type[nn.Module], target_class: str,
     in a PyTorch module.'''
     # Lambda function used to replace the target module with the replacement module
     def replace_module_by_class_and_name_fn(full_name, module, name, child):
-        print(f"{full_name}: {child.__class__.__name__}")
+        #print(f"{full_name}: {child.__class__.__name__}")
         # If the current module is of the target class, replace it
         if name == target_name and child.__class__.__name__ == target_class:
-            print("Replacing: ", target_class, replacement_class)
+            #print("Replacing: ", target_class, replacement_class)
             setattr(module, name, replacement_class(child, *other_init_args))
     
     # Recursively apply the replacement function to all named modules
@@ -209,8 +223,10 @@ class MySharedAttentionSwapper():
         # Proportion of steps after which to replace cross/self attention
         self.prop_steps_cross = prop_steps_cross 
         self.prop_steps_self = prop_steps_self 
+
         # Mapper matrix for attention swapping
         self.mapper = get_replacement_mapper(prompts, tokenizer).to(torch_device)
+
         # Number of prompts
         self.num_prompts = len(prompts)
         
@@ -236,13 +252,23 @@ class MySharedAttentionSwapper():
         '''Swap attention probabilities based on the current state of the model.'''
         # We assume the first element of the batch corresponds to the original prompt.
         # Each other element in the batch corresponds to a prompt that may need attention swapping.
+        # ipdb.set_trace()
         if ((is_cross_attn and self.cur_step < self.num_steps_cross) or 
             (not is_cross_attn and self.cur_step < self.num_steps_self)):
             attn_base, attn_replace = attn_probs[0], attn_probs[1:]
+
             if is_cross_attn:
-                ####TODO####
+                ####TODO####s
                 # Swap attention probabilities for cross attention
-                pass
+                #check dim
+
+                # attn_replace = self.mapper @ attn_replace
+                # attn_probs[1:] = attn_replace
+                #ipdb.set_trace()
+
+                mapper_expanded = self.mapper.unsqueeze(1).expand(-1, attn_replace.shape[1], -1, -1)
+                mapped_attn_replace = torch.matmul(attn_replace, mapper_expanded.transpose(-1, -2))
+                attn_probs[1:] = mapped_attn_replace
 
                 ####END_TODO####
             else:
@@ -253,7 +279,7 @@ class MySharedAttentionSwapper():
         return attn_probs
         
 class MyCrossAttention(nn.Module):
-    
+
     def __init__(self, attn: nn.Module, swapper: MySharedAttentionSwapper):
         super().__init__()
         self.swapper = swapper
@@ -275,20 +301,20 @@ class MyCrossAttention(nn.Module):
     ) -> torch.Tensor:
         # Source: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py#L453
         r"""
-        The forward method of the `Attention` class.
+        The forward method of the Attention class.
 
         Args:
-            hidden_states (`torch.Tensor`):
+            hidden_states (torch.Tensor):
                 The hidden states of the query.
-            encoder_hidden_states (`torch.Tensor`, *optional*):
+            encoder_hidden_states (torch.Tensor, optional):
                 The hidden states of the encoder.
-            attention_mask (`torch.Tensor`, *optional*):
-                The attention mask to use. If `None`, no mask is applied.
+            attention_mask (torch.Tensor, optional):
+                The attention mask to use. If None, no mask is applied.
             **cross_attention_kwargs:
                 Additional keyword arguments to pass along to the cross attention.
 
         Returns:
-            `torch.Tensor`: The output of the attention layer.
+            torch.Tensor: The output of the attention layer.
         """
         # For Prompt to Prompt we need to know whether or not we are in cross or self attention
         is_cross_attn = True if encoder_hidden_states is not None else False
@@ -312,11 +338,26 @@ class MyCrossAttention(nn.Module):
             encoder_hidden_states = self.attn.norm_encoder_hidden_states(encoder_hidden_states)
 
         ####TODO####
-        query = ...
-        key = ...
-        value = ...
+        query = self.attn.to_q(hidden_states)
+        key = self.attn.to_k(encoder_hidden_states)
+        value = self.attn.to_v(encoder_hidden_states)
 
-        attention_probs = ...
+        query = self.attn.head_to_batch_dim(query)
+        key = self.attn.head_to_batch_dim(key)
+        value = self.attn.head_to_batch_dim(value)
+
+
+        att_score = torch.bmm(query, key.transpose(-2, -1)) / (query.size(-1) ** 0.5)
+
+        #add the attention score
+
+        if attention_mask:
+            #ipdb.set_trace()
+            if attention_mask.ndim == 4:
+                attention_mask = attention_mask.squeeze(1)
+            att_score += attention_mask
+
+        attention_probs = torch.softmax(att_score, dim=-1)
         ####END_TODO####
 
         # -----------------------------------------------------------------------------
@@ -339,7 +380,17 @@ class MyCrossAttention(nn.Module):
         # -----------------------------------------------------------------------------
         
         ####TODO####
-        hidden_states = ...
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = self.attn.batch_to_head_dim(hidden_states)
+
+        for layer in self.attn.to_out:
+          hidden_states = layer(hidden_states) 
+        
+        if input_ndim == 4:
+            hidden_states = hidden_states.permute(0, 1, 3, 2).contiguous().view(batch_size, channel, height, width)
+
+        if self.attn.residual_connection:
+            hidden_states = hidden_states + residual
 
         ####END_TODO####
 
@@ -387,7 +438,12 @@ class MyLDMPipeline():
     def get_random_noise(batch_size: int, channel: int, height: int, width: int, generator: torch.Generator, same_noise_in_batch=True) -> torch.Tensor:
         '''Generate random noise of the specified shape.'''
         ####TODO####
-        noise = torch.randn(size= (batch_size, channel, width, height), generator= generator)
+        if same_noise_in_batch:
+            noise = torch.randn(size= (1, channel, width, height), generator= generator, device=torch_device, dtype = torch_dtype)
+            noise = noise.repeat(batch_size, 1, 1, 1)
+        else:    
+            noise = torch.randn(size= (batch_size, channel, width, height), generator= generator, device=torch_device, dtype = torch_dtype)
+        return noise
         ####END_TODO####
 
     def generate_image_from_text(self, prompt: list, swapper: MySharedAttentionSwapper) -> Image:
@@ -456,4 +512,3 @@ class MyLDMPipeline():
         image = image_processor.postprocess(image, output_type="pil")
 
         return image
-       
